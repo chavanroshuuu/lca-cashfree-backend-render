@@ -17,6 +17,7 @@
 
 const express = require('express');
 const cors = require('cors');
+const https = require('https');
 
 const app = express();
 app.use(cors());
@@ -47,9 +48,39 @@ function cashfreeConfig() {
   };
 }
 
+
+function cashfreePost(baseUrl, path, appId, secretKey, bodyObj) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify(bodyObj);
+    const url = new URL(baseUrl + path);
+    const req = https.request({
+      hostname: url.hostname,
+      path: url.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(data),
+        'x-client-id': appId,
+        'x-client-secret': secretKey,
+        'x-api-version': '2023-08-01',
+      },
+    }, (res) => {
+      let out = '';
+      res.on('data', (c) => { out += c; });
+      res.on('end', () => {
+        try { resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, data: JSON.parse(out || '{}') }); }
+        catch (e) { resolve({ ok: false, status: res.statusCode, data: { message: out.slice(0, 300) } }); }
+      });
+    });
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
+
 app.get('/health', (req, res) => {
   const cfg = cashfreeConfig();
-  res.json({ ok: true, mode: cfg.mode, keysSet: !!(cfg.appId && cfg.secretKey) });
+  res.json({ ok: true, mode: cfg.mode, keysSet: !!(cfg.appId && cfg.secretKey), version: 'customer-details-fix-v3-https' });
 });
 
 // POST /api/cashfree-link
@@ -88,25 +119,31 @@ app.post('/api/cashfree-link', async (req, res) => {
       ? 'Light Console Academy - ' + titles[0]
       : 'Light Console Academy Cart - ' + titles.join(', ');
 
-    const cfRes = await fetch(cfg.baseUrl + '/links', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-client-id': cfg.appId,
-        'x-client-secret': cfg.secretKey,
-        'x-api-version': '2023-08-01',
-      },
-      body: JSON.stringify({
+    // FIX: Cashfree ko customer_details me sirf email kaafi nahi hota, docs example me
+    // customer_name + customer_phone + customer_email teeno hote hain.
+    // Site login me phone nahi hai, isliye test ke liye Cashfree docs wala test phone use karo.
+    // Email khali ho to link nahi banega, pehle hi clear error do.
+    if (!email) {
+      return res.status(400).json({ error: 'Login email nahi mila. Dobara login karke Buy dabao.' });
+    }
+    const customerName = String(email).split('@')[0] || 'LCA Customer';
+    const cfResult = await cashfreePost(cfg.baseUrl, '/links', cfg.appId, cfg.secretKey, {
         link_id: linkId,
         link_amount: sum,
         link_currency: 'INR',
         link_purpose: purpose,
-        customer_details: email ? { customer_email: email } : undefined,
-      }),
-    });
-    const data = await cfRes.json();
+        customer_details: {
+          customer_name: customerName,
+          customer_phone: '9999999999',
+          customer_email: email,
+        },
+        link_notify: { send_email: false, send_sms: false },
+      });
+    const cfRes = { ok: cfResult.ok };
+    const data = cfResult.data;
     if (!cfRes.ok || !data.link_url) {
-      return res.status(502).json({ error: 'Cashfree se link nahi bana.', cashfree: data });
+      const cfMsg = data.message || data.error || (data.errors && data.errors[0] && data.errors[0].message) || JSON.stringify(data).slice(0, 300);
+      return res.status(502).json({ error: 'Cashfree se link nahi bana: ' + cfMsg, cashfree: data });
     }
     return res.json({ link_url: data.link_url, link_id: data.link_id || linkId, amount: sum, mode: cfg.mode });
   } catch (e) {
