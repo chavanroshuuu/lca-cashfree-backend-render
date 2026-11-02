@@ -1,0 +1,1 @@
+{"dependencies":{"cors":"^2.8.5","express":"^4.19.2"},"main":"api/index.js","name":"lca-cashfree-backend","private":true,"scripts":{"start":"node api/index.js"},"version":"1.0.0"}
