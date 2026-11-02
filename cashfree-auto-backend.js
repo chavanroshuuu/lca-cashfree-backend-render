@@ -108,7 +108,7 @@ function publicUrl() {
 
 app.get('/health', (req, res) => {
   const cfg = cashfreeConfig();
-  res.json({ ok: true, mode: cfg.mode, keysSet: !!(cfg.appId && cfg.secretKey), adminReady: !!adminDb, adminError: adminInitError || null, version: 'auto-purchases-v1' });
+  res.json({ ok: true, mode: cfg.mode, keysSet: !!(cfg.appId && cfg.secretKey), adminReady: !!adminDb, adminError: adminInitError || null, version: 'auto-purchases-v2' });
 });
 
 // ---------- Purchase grant (ek hi jagah, webhook aur check-payment dono isi ko bulate hain) ----------
@@ -215,6 +215,45 @@ app.post('/api/check-payment', async (req, res) => {
     if (!link_id) return res.status(400).json({ error: 'link_id nahi mila.' });
     const out = await verifyAndGrant(link_id);
     return res.json(out);
+  } catch (e) {
+    return res.status(500).json({ error: 'Backend error: ' + e.message });
+  }
+});
+
+// ---------- Migrate: purani array-only purchases ko subcollection me copy karo ----------
+// Body: { email } - sirf wahi files copy hongi jo user doc ke purchases array me pehle se hain,
+// koi nayi file invent nahi hogi. Isse paid_file_links ka permission-denied thik hoga,
+// kyunki rules subcollection doc ko check karta hai.
+app.post('/api/migrate-purchases', async (req, res) => {
+  try {
+    if (!adminDb) return res.status(500).json({ error: 'Firebase Admin ready nahi hai.' });
+    const { email } = req.body || {};
+    if (!email) return res.status(400).json({ error: 'Email nahi mila.' });
+    let uid = null;
+    try { if (adminAuth) { const u = await adminAuth.getUserByEmail(email); uid = u.uid; } } catch (e) {}
+    if (!uid) {
+      const q = await adminDb.collection('users').where('email', '==', email).limit(1).get();
+      if (!q.empty) uid = q.docs[0].id;
+    }
+    if (!uid) return res.status(404).json({ error: 'User account nahi mila email se: ' + email });
+    const userRef = adminDb.collection('users').doc(uid);
+    const snap = await userRef.get();
+    if (!snap.exists) return res.status(404).json({ error: 'User doc nahi mila.' });
+    const arr = Array.isArray(snap.data().purchases) ? snap.data().purchases : [];
+    let migrated = 0;
+    for (const p of arr) {
+      const fileId = String(typeof p === 'string' ? p : (p.fileId || '')).toLowerCase();
+      if (!fileId) continue;
+      await userRef.collection('purchases').doc(fileId).set({
+        fileId, fileName: (typeof p === 'object' && p.fileName) ? p.fileName : (FILE_TITLES[fileId] || fileId),
+        amount: (typeof p === 'object' && p.amount) ? Number(p.amount) : 0,
+        cashfreeLinkId: (typeof p === 'object' && p.cashfreeLinkId) ? p.cashfreeLinkId : 'manual',
+        paidAt: (typeof p === 'object' && p.paidAt) ? p.paidAt : new Date().toISOString(),
+      }, { merge: true });
+      migrated++;
+    }
+    await userRef.set({ purchasesUseSubcollection: true }, { merge: true });
+    return res.json({ ok: true, uid, migrated, totalArray: arr.length });
   } catch (e) {
     return res.status(500).json({ error: 'Backend error: ' + e.message });
   }
