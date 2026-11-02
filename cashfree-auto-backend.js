@@ -118,9 +118,11 @@ async function grantPurchase(linkId) {
   const orderSnap = await orderRef.get();
   if (!orderSnap.exists) return { granted: false, error: 'Pending order nahi mila: ' + linkId };
   const order = orderSnap.data();
-  if (order.status === 'paid') {
-    return { granted: true, already: true, files: order.files || [], email: order.email };
-  }
+  const wasPaid = order.status === 'paid';
+  // Early return mat karo: agar admin ne galti se purchase doc delete kar diya ho to
+  // dobara check-payment karne par wahi purchase wapas ban jani chahiye, warna order paid
+  // hone ke baad purchase kabhi wapas nahi aayegi. Neeche ka code har file ka doc check karke
+  // sirf missing wali ko dobara banata hai, maujood wali ko chhedta nahi hai.
   // User UID nikalo: pehle Auth se email se, nahi to users collection me email se
   let uid = null;
   try {
@@ -141,9 +143,9 @@ async function grantPurchase(linkId) {
     await userRef.collection('purchases').doc(fileId).set(entry, { merge: true });
     if (!newPurchases.some((p) => p && (p.fileId === fileId))) newPurchases.push(entry);
   }
-  await userRef.set({ purchases: newPurchases }, { merge: true });
+  await userRef.set({ purchases: newPurchases, purchasesUseSubcollection: true }, { merge: true });
   await orderRef.set({ status: 'paid', grantedAt: new Date().toISOString() }, { merge: true });
-  return { granted: true, already: false, files: order.files || [], email: order.email, uid };
+  return { granted: true, already: wasPaid, files: order.files || [], email: order.email, uid };
 }
 
 async function verifyAndGrant(linkId) {
