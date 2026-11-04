@@ -1,4 +1,10 @@
-// Cashfree Auto Link + Automatic My Purchases Backend - v2 (auto-purchases-v1)
+// Cashfree Auto Link + Automatic My Purchases + VIP Subscription (TEST) Backend - v3 (auto-purchases-v3-vip-test)
+// VIP TEST NOTE: VIP is a 30-day plan sold via the SAME Cashfree payment-link backend, NOT true autopay/NACH.
+// True recurring autopay needs Cashfree Subscriptions + mandate, which is NOT activated yet.
+// Test VIP: one Cashfree link for Rs 99, backend verifies PAID, then auto-grants isVIP/vipUntil.
+// Discount is then AUTOMATIC in Resources (VIP_RATE 0.30 already in Resources code, no Resources change needed).
+// Cancel VIP: backend requires Firebase ID token (owner only), sets isVIP false immediately,
+// records 60% admin / 40% user refund split. In TEST mode no real money moves, refund is only a record.
 // Ye file Blogger theme / Resources code me NAHI dalni hai. Sirf Render / Vercel par host karo.
 // Secret Key aur Firebase Service Account sirf yahan environment variables me rahenge, kabhi frontend code me nahi.
 //
@@ -41,6 +47,10 @@ const FILE_TITLES = {
   'titan-palette': 'Avolites Titan Palette Pack',
   'ma3-effects': 'grandMA3 Effects Preset Pack',
 };
+// VIP TEST PLAN (temporary Rs 99/month, final price user will state later - do NOT treat as final live price)
+const VIP_PRICE = 99;
+const VIP_DAYS = 30;
+const VIP_PLAN = 'Monthly VIP (Test)';
 
 function cashfreeConfig() {
   const env = (process.env.CASHFREE_ENV || 'test').toLowerCase();
@@ -108,7 +118,7 @@ function publicUrl() {
 
 app.get('/health', (req, res) => {
   const cfg = cashfreeConfig();
-  res.json({ ok: true, mode: cfg.mode, keysSet: !!(cfg.appId && cfg.secretKey), adminReady: !!adminDb, adminError: adminInitError || null, version: 'auto-purchases-v2' });
+  res.json({ ok: true, mode: cfg.mode, keysSet: !!(cfg.appId && cfg.secretKey), adminReady: !!adminDb, adminError: adminInitError || null, version: 'auto-purchases-v3-vip-test' });
 });
 
 // ---------- Purchase grant (ek hi jagah, webhook aur check-payment dono isi ko bulate hain) ----------
@@ -159,6 +169,156 @@ async function verifyAndGrant(linkId) {
   if (!g.granted) return { paid: true, status, granted: false, error: g.error };
   return { paid: true, status, granted: true, already: !!g.already, files: g.files, email: g.email };
 }
+
+
+// ---------- VIP helpers ----------
+async function findUidByEmail(email) {
+  let uid = null;
+  try { if (adminAuth) { const u = await adminAuth.getUserByEmail(email); uid = u.uid; } } catch (e) {}
+  if (!uid && adminDb) {
+    const q = await adminDb.collection('users').where('email', '==', email).limit(1).get();
+    if (!q.empty) uid = q.docs[0].id;
+  }
+  return uid;
+}
+function vipSplit(price) {
+  const adminShare = Math.round(price * 0.6);
+  return { adminShare, userRefund: price - adminShare };
+}
+async function grantVip(linkId) {
+  if (!adminDb) return { granted: false, error: 'Firebase Admin ready nahi hai. Render me FIREBASE_SERVICE_ACCOUNT_JSON set karo.' };
+  const vipRef = adminDb.collection('pending_vip_orders').doc(linkId);
+  const vipSnap = await vipRef.get();
+  if (!vipSnap.exists) return { granted: false, error: 'Pending VIP order nahi mila: ' + linkId };
+  const order = vipSnap.data();
+  const uid = await findUidByEmail(order.email);
+  if (!uid) return { granted: false, error: 'User account nahi mila email se: ' + order.email };
+  const userRef = adminDb.collection('users').doc(uid);
+  const userSnap = await userRef.get();
+  const old = userSnap.exists ? userSnap.data() : {};
+  const oldUntil = old.vipUntil && typeof old.vipUntil.toDate === 'function' ? old.vipUntil.toDate() : (old.vipUntil ? new Date(old.vipUntil) : null);
+  if (order.status === 'paid' && old.isVIP === true && old.vipLinkId === linkId && oldUntil && oldUntil > new Date()) {
+    return { granted: true, already: true, email: order.email, uid, vipUntil: oldUntil.toISOString() };
+  }
+  const price = Number(order.price) || VIP_PRICE;
+  const split = vipSplit(price);
+  const now = new Date();
+  const until = new Date(now.getTime() + VIP_DAYS * 86400000);
+  await userRef.set({
+    email: order.email, isVIP: true, vipUntil: until, vipStart: now, vipPlan: order.plan || VIP_PLAN,
+    vipLinkId: linkId, vipPaidAt: now.toISOString(), vipStatus: 'active', vipPrice: price,
+    vipAdminShare: split.adminShare, vipUserRefund: split.userRefund, vipRefundStatus: null, vipCancelAt: null,
+  }, { merge: true });
+  await vipRef.set({ status: 'paid', grantedAt: now.toISOString() }, { merge: true });
+  return { granted: true, already: false, email: order.email, uid, vipUntil: until.toISOString(), vipPrice: price };
+}
+async function verifyAndGrantVip(linkId) {
+  const cfg = cashfreeConfig();
+  if (!cfg.appId || !cfg.secretKey) return { paid: false, error: 'Cashfree keys set nahi hain.' };
+  const cf = await cashfreeReq(cfg.baseUrl, '/links/' + encodeURIComponent(linkId), 'GET', cfg.appId, cfg.secretKey, null);
+  if (!cf.ok) return { paid: false, error: 'Cashfree VIP link check fail: ' + (cf.data.message || JSON.stringify(cf.data).slice(0, 200)) };
+  const status = String(cf.data.link_status || '').toUpperCase();
+  if (status !== 'PAID') return { paid: false, status, linkId };
+  const g = await grantVip(linkId);
+  if (!g.granted) return { paid: true, status, granted: false, error: g.error };
+  return { paid: true, status, granted: true, already: !!g.already, email: g.email, vipUntil: g.vipUntil, vipPrice: g.vipPrice };
+}
+
+// ---------- VIP link banao (TEST) ----------
+app.post('/api/vip-link', async (req, res) => {
+  try {
+    const cfg = cashfreeConfig();
+    if (!cfg.appId || !cfg.secretKey) return res.status(500).json({ error: 'Cashfree keys backend me set nahi hain.' });
+    const { email, returnUrl } = req.body || {};
+    if (!email) return res.status(400).json({ error: 'Login email nahi mila. Dobara login karke Buy VIP dabao.' });
+    if (adminDb) {
+      const uid = await findUidByEmail(email);
+      if (uid) {
+        const snap = await adminDb.collection('users').doc(uid).get();
+        if (snap.exists) {
+          const d = snap.data();
+          const until = d.vipUntil && typeof d.vipUntil.toDate === 'function' ? d.vipUntil.toDate() : (d.vipUntil ? new Date(d.vipUntil) : null);
+          if (d.isVIP === true && until && until > new Date()) {
+            return res.status(400).json({ error: 'VIP pehle se active hai, expiry: ' + until.toISOString().slice(0, 10) + '. Pehle cancel karo ya expiry ka wait karo.' });
+          }
+        }
+      }
+    }
+    const linkId = 'lca_vip_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+    const customerName = String(email).split('@')[0] || 'LCA Customer';
+    const base = publicUrl();
+    const linkMeta = {};
+    if (base) linkMeta.notify_url = base + '/api/cashfree-webhook';
+    if (returnUrl) linkMeta.return_url = returnUrl;
+    const cf = await cashfreeReq(cfg.baseUrl, '/links', 'POST', cfg.appId, cfg.secretKey, {
+      link_id: linkId, link_amount: VIP_PRICE, link_currency: 'INR', link_purpose: 'Light Console Academy - VIP Monthly (Test)',
+      customer_details: { customer_name: customerName, customer_phone: '9999999999', customer_email: email },
+      link_notify: { send_email: false, send_sms: false },
+      link_meta: linkMeta,
+    });
+    if (!cf.ok || !cf.data.link_url) {
+      const msg = cf.data.message || cf.data.error || (cf.data.errors && cf.data.errors[0] && cf.data.errors[0].message) || JSON.stringify(cf.data).slice(0, 300);
+      return res.status(502).json({ error: 'Cashfree se VIP link nahi bana: ' + msg, cashfree: cf.data });
+    }
+    if (adminDb) {
+      try {
+        await adminDb.collection('pending_vip_orders').doc(linkId).set({
+          link_id: linkId, email, plan: VIP_PLAN, price: VIP_PRICE, durationDays: VIP_DAYS, status: 'pending', mode: cfg.mode, createdAt: new Date().toISOString(),
+        });
+      } catch (e) { console.log('pending vip order save fail:', e.message); }
+    }
+    return res.json({ link_url: cf.data.link_url, link_id: cf.data.link_id || linkId, amount: VIP_PRICE, plan: VIP_PLAN, durationDays: VIP_DAYS, mode: cfg.mode });
+  } catch (e) {
+    return res.status(500).json({ error: 'Backend error: ' + e.message });
+  }
+});
+
+// ---------- VIP return check ----------
+app.post('/api/check-vip-payment', async (req, res) => {
+  try {
+    const { link_id } = req.body || {};
+    if (!link_id) return res.status(400).json({ error: 'link_id nahi mila.' });
+    const out = await verifyAndGrantVip(link_id);
+    return res.json(out);
+  } catch (e) {
+    return res.status(500).json({ error: 'Backend error: ' + e.message });
+  }
+});
+
+// ---------- VIP cancel (owner only, Firebase ID token required) ----------
+app.post('/api/cancel-vip', async (req, res) => {
+  try {
+    if (!adminDb || !adminAuth) return res.status(500).json({ error: 'Firebase Admin ready nahi hai.' });
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    if (!token) return res.status(401).json({ error: 'Login token nahi mila. Dobara login karke Cancel dabao.' });
+    let decoded;
+    try { decoded = await adminAuth.verifyIdToken(token); } catch (e) { return res.status(401).json({ error: 'Login token invalid hai. Dobara login karo.' }); }
+    const uid = decoded.uid;
+    const userRef = adminDb.collection('users').doc(uid);
+    const snap = await userRef.get();
+    if (!snap.exists) return res.status(404).json({ error: 'User doc nahi mila.' });
+    const d = snap.data();
+    const until = d.vipUntil && typeof d.vipUntil.toDate === 'function' ? d.vipUntil.toDate() : (d.vipUntil ? new Date(d.vipUntil) : null);
+    if (!(d.isVIP === true && until && until > new Date())) {
+      return res.status(400).json({ error: 'Koi active VIP nahi hai jo cancel ho sake. VIP pehle se expire ya cancel hai.' });
+    }
+    const price = Number(d.vipPrice) || VIP_PRICE;
+    const split = vipSplit(price);
+    const now = new Date();
+    await userRef.set({
+      isVIP: false, vipStatus: 'cancelled', vipCancelAt: now, vipRefundAmount: split.userRefund,
+      vipAdminShare: split.adminShare, vipRefundStatus: 'pending',
+    }, { merge: true });
+    await adminDb.collection('vip_cancellations').doc(uid + '_' + now.getTime()).set({
+      uid, email: d.email || decoded.email || '', vipLinkId: d.vipLinkId || '', vipPrice: price,
+      adminShare: split.adminShare, userRefund: split.userRefund, cancelledAt: now.toISOString(), refundStatus: 'pending',
+    });
+    return res.json({ cancelled: true, vipPrice: price, adminShare: split.adminShare, userRefund: split.userRefund, refundNote: 'Refund 5-7 working days me original payment method par aayega (TEST mode me asli paisa nahi hilta, sirf record banega).' });
+  } catch (e) {
+    return res.status(500).json({ error: 'Backend error: ' + e.message });
+  }
+});
 
 // ---------- Link banao ----------
 app.post('/api/cashfree-link', async (req, res) => {
@@ -268,7 +428,15 @@ app.post('/api/cashfree-webhook', async (req, res) => {
     // Cashfree ko turant 200 do, warna wo retry karega. Grant background me karo.
     res.json({ ok: true, received: !!linkId });
     if (!linkId) return;
-    const out = await verifyAndGrant(linkId);
+    let out;
+    if (adminDb) {
+      try {
+        const vipSnap = await adminDb.collection('pending_vip_orders').doc(linkId).get();
+        out = vipSnap.exists ? await verifyAndGrantVip(linkId) : await verifyAndGrant(linkId);
+      } catch (e) { out = await verifyAndGrant(linkId); }
+    } else {
+      out = await verifyAndGrant(linkId);
+    }
     console.log('webhook grant:', linkId, out.paid, out.granted, out.error || '');
   } catch (e) {
     console.log('webhook error:', e.message);
